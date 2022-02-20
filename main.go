@@ -2,8 +2,8 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"io"
-	"log"
 	"net/http"
 	"os"
 	"os/signal"
@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/PuerkitoBio/goquery"
+	"go.uber.org/zap"
 )
 
 type CrawlResult struct {
@@ -93,7 +94,7 @@ func (r requester) Get(ctx context.Context, url string) (Page, error) {
 
 //Crawler - интерфейс (контракт) краулера
 type Crawler interface {
-	Scan(ctx context.Context, url string, depth int, domain string)
+	Scan(ctx context.Context, url string, depth int, domain string, logger *zap.Logger)
 	ChanResult() <-chan CrawlResult
 	AddDepth()
 }
@@ -115,8 +116,11 @@ func NewCrawler(r Requester) *crawler {
 	}
 }
 
-func (c *crawler) Scan(ctx context.Context, url string, depth int, domain string) {
+func (c *crawler) Scan(ctx context.Context, url string, depth int, domain string, logger *zap.Logger) {
 	if c.depth > 0 {
+		logger.Info("add depth",
+			zap.Int("now depth", depth),
+		)
 		depth += c.depth
 		c.mu.Lock()
 		c.depth = 0
@@ -154,7 +158,7 @@ func (c *crawler) Scan(ctx context.Context, url string, depth int, domain string
 				link = domain + link
 			}
 
-			go c.Scan(ctx, link, depth-1, domain) //На все полученные ссылки запускаем новую рутину сборки
+			go c.Scan(ctx, link, depth-1, domain, logger) //На все полученные ссылки запускаем новую рутину сборки
 		}
 	}
 }
@@ -176,16 +180,24 @@ type Config struct {
 	MaxErrors  int
 	Url        string
 	Timeout    int //in seconds
+	Logger     *zap.Logger
 }
 
 func main() {
-
+	/* logger.Info("failed to fetch URL",
+		// Structured context as strongly typed Field values.
+		zap.String("url", "test"),
+		zap.Int("attempt", 3),
+		zap.Duration("backoff", time.Second),
+	) */
+	logger, _ := zap.NewProduction()
 	cfg := Config{
 		MaxDepth:   3,
 		MaxResults: 10,
 		MaxErrors:  5,
 		Url:        "https://telegram.org",
 		Timeout:    20,
+		Logger:     logger,
 	}
 	var cr Crawler
 	var r Requester
@@ -194,8 +206,8 @@ func main() {
 	cr = NewCrawler(r)
 
 	ctx, cancel := context.WithCancel(context.Background())
-	go cr.Scan(ctx, cfg.Url, cfg.MaxDepth, cfg.Url) //Запускаем краулер в отдельной рутине
-	go processResult(ctx, cancel, cr, cfg)          //Обрабатываем результаты в отдельной рутине
+	go cr.Scan(ctx, cfg.Url, cfg.MaxDepth, cfg.Url, cfg.Logger) //Запускаем краулер в отдельной рутине
+	go processResult(ctx, cancel, cr, cfg)                      //Обрабатываем результаты в отдельной рутине
 
 	sigCh := make(chan os.Signal, 1) //Создаем канал для приема сигналов
 	signal.Notify(sigCh,
@@ -204,14 +216,15 @@ func main() {
 	) //Подписываемся на сигнал SIGINT
 	for {
 		select {
-
 		case <-ctx.Done(): //Если всё завершили - выходим
+			cfg.Logger.Info("Done")
 			return
 		case signal := <-sigCh:
 			if signal == syscall.SIGUSR1 {
+				cfg.Logger.Info("receiving the SIGUSR1 signal")
 				cr.AddDepth()
 			} else if signal == syscall.SIGINT {
-				cfg.MaxDepth = cfg.MaxDepth + 50
+				cfg.Logger.Info("receiving the SIGINT signal")
 				cancel() //Если пришёл сигнал SigInt - завершаем контекст
 			}
 
@@ -221,21 +234,32 @@ func main() {
 
 func processResult(ctx context.Context, cancel func(), cr Crawler, cfg Config) {
 	var maxResult, maxErrors = cfg.MaxResults, cfg.MaxErrors
+
+	defer func() {
+		if r := recover(); r != nil {
+			cfg.Logger.Panic(fmt.Sprintln("Panic error: ", r))
+		}
+	}()
+
 	for {
+		panic("PANIC!!!")
 		select {
 		case <-ctx.Done():
-			return
+			panic("New panic!")
 		case msg := <-cr.ChanResult():
 			if msg.Err != nil {
 				maxErrors--
-				log.Printf("crawler result return err: %s\n", msg.Err.Error())
+				cfg.Logger.Error(fmt.Sprintf("crawler result return err: %s\n", msg.Err.Error()))
 				if maxErrors <= 0 {
 					cancel()
 					return
 				}
 			} else {
 				maxResult--
-				log.Printf("crawler result: [url: %s] Title: %s\n", msg.Url, msg.Title)
+				cfg.Logger.Info("crawler result",
+					zap.String("url", msg.Url),
+					zap.String("title", msg.Title),
+				)
 				if maxResult <= 0 {
 					cancel()
 					return
